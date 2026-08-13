@@ -192,6 +192,8 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     } catch (error) {
       state.limits = null;
       state.limitsError = error instanceof Error ? error.message : 'Plan limits are unavailable.';
+    } finally {
+      render(api.context);
     }
   }
 
@@ -202,6 +204,8 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
     } catch (error) {
       state.activity = null;
       state.activityError = error instanceof Error ? error.message : 'Token activity is unavailable.';
+    } finally {
+      render(api.context);
     }
   }
 

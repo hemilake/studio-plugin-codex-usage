@@ -9,6 +9,7 @@ import { CodexAppServerClient, codexAppServerEnvironment } from './codex-client.
 type FakeProcess = {
   process: ChildProcessWithoutNullStreams;
   killedSignals: NodeJS.Signals[];
+  stdout: PassThrough;
 };
 
 function fakeAppServer(): FakeProcess {
@@ -41,7 +42,7 @@ function fakeAppServer(): FakeProcess {
       queueMicrotask(() => stdout.write(`${JSON.stringify({ id: request.id, result })}\n`));
     }
   });
-  return { process: child, killedSignals };
+  return { process: child, killedSignals, stdout };
 }
 
 test('opts usage app-server out of agentx interactive remote transport', () => {
@@ -50,6 +51,50 @@ test('opts usage app-server out of agentx interactive remote transport', () => {
     KEEP_ME: 'yes',
     CDXX_INTEGRATION_MODE: 'disabled',
   });
+});
+
+test('runs account reads concurrently after one serialized freshness check', async () => {
+  const child = fakeAppServer();
+  const requests: { id: number; method: string }[] = [];
+  child.process.stdin.removeAllListeners('data');
+  child.process.stdin.on('data', (chunk: Buffer) => {
+    for (const line of chunk.toString('utf8').trim().split('\n')) {
+      if (!line) continue;
+      const request = JSON.parse(line) as { id?: number; method: string };
+      if (typeof request.id !== 'number') continue;
+      if (request.method === 'initialize') {
+        queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: request.id, result: {} })}\n`));
+        continue;
+      }
+      requests.push({ id: request.id, method: request.method });
+      if (requests.length === 2) {
+        for (const pending of requests) {
+          queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: pending.id, result: { method: pending.method } })}\n`));
+        }
+      }
+    }
+  });
+  const client = new CodexAppServerClient({
+    readStat: async () => ({ dev: 1, ino: 2, size: 100, mtimeMs: 1 }),
+    spawnAppServer: () => child.process,
+  });
+
+  try {
+    const results = await Promise.all([
+      client.request('account/rateLimits/read'),
+      client.request('account/usage/read'),
+    ]);
+    assert.deepEqual(requests.map((request) => request.method), [
+      'account/rateLimits/read',
+      'account/usage/read',
+    ]);
+    assert.deepEqual(results, [
+      { method: 'account/rateLimits/read' },
+      { method: 'account/usage/read' },
+    ]);
+  } finally {
+    client.close();
+  }
 });
 
 test('restarts app-server before the next request when auth.json changes', async () => {
