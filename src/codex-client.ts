@@ -1,4 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { stat } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import readline from 'node:readline';
 
 type RpcResponse = {
@@ -14,27 +17,109 @@ type PendingRequest = {
 };
 
 const REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_SERVER_MAX_AGE_MS = 10 * 60_000;
+
+type FileStat = {
+  dev: number | bigint;
+  ino: number | bigint;
+  size: number;
+  mtimeMs: number;
+};
+
+type CodexAppServerClientOptions = {
+  authPath?: string;
+  maxServerAgeMs?: number;
+  now?: () => number;
+  readStat?: (filePath: string) => Promise<FileStat>;
+  spawnAppServer?: () => ChildProcessWithoutNullStreams;
+};
+
+function fingerprint(fileStat: FileStat): string {
+  return `${fileStat.dev}:${fileStat.ino}:${fileStat.size}:${fileStat.mtimeMs}`;
+}
 
 /** Small JSON-RPC client for the official `codex app-server` stdio transport. */
 export class CodexAppServerClient {
   private process: ChildProcessWithoutNullStreams | null = null;
   private startPromise: Promise<void> | null = null;
+  private requestQueue: Promise<unknown> = Promise.resolve();
   private initialized = false;
   private nextId = 1;
   private pending = new Map<number, PendingRequest>();
   private stderrTail = '';
+  private authFingerprint: string | null = null;
+  private startedAt = 0;
+  private readonly authPath: string;
+  private readonly maxServerAgeMs: number;
+  private readonly now: () => number;
+  private readonly readStat: (filePath: string) => Promise<FileStat>;
+  private readonly spawnAppServer: () => ChildProcessWithoutNullStreams;
+
+  constructor(options: CodexAppServerClientOptions = {}) {
+    this.authPath = options.authPath ?? path.join(os.homedir(), '.codex', 'auth.json');
+    this.maxServerAgeMs = options.maxServerAgeMs ?? DEFAULT_SERVER_MAX_AGE_MS;
+    this.now = options.now ?? Date.now;
+    this.readStat = options.readStat ?? stat;
+    this.spawnAppServer = options.spawnAppServer ?? (() => spawn('codex', ['app-server', '--stdio'], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: process.env,
+    }));
+  }
 
   async request(method: string, params: JsonRecord = {}): Promise<unknown> {
-    await this.ensureStarted();
-    return this.sendRequest(method, params);
+    const run = async (): Promise<unknown> => {
+      await this.ensureFreshServer();
+      return this.sendRequest(method, params);
+    };
+    const pending = this.requestQueue.then(run, run);
+    this.requestQueue = pending.catch(() => undefined);
+    return pending;
   }
 
   close(): void {
     const process = this.process;
     this.process = null;
     this.initialized = false;
+    this.authFingerprint = null;
+    this.startedAt = 0;
     if (process && !process.killed) process.kill('SIGTERM');
     this.rejectPending(new Error('Codex app-server stopped.'));
+  }
+
+  private async authFileFingerprint(): Promise<string> {
+    try {
+      return fingerprint(await this.readStat(this.authPath));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return 'missing';
+      throw error;
+    }
+  }
+
+  private async ensureFreshServer(): Promise<void> {
+    const beforeStart = await this.authFileFingerprint();
+    const authChanged = this.authFingerprint !== null && this.authFingerprint !== beforeStart;
+    const expired = this.startedAt > 0 && this.now() - this.startedAt >= this.maxServerAgeMs;
+    if (authChanged || expired) this.stopForRestart();
+
+    await this.ensureStarted();
+
+    // If auth.json changed while app-server was starting, restart once more so
+    // the process cannot retain the account that was current before the swap.
+    const afterStart = await this.authFileFingerprint();
+    if (afterStart !== beforeStart) {
+      this.stopForRestart();
+      await this.ensureStarted();
+    }
+    this.authFingerprint = afterStart;
+  }
+
+  private stopForRestart(): void {
+    const process = this.process;
+    this.process = null;
+    this.initialized = false;
+    this.startedAt = 0;
+    if (process && !process.killed) process.kill('SIGTERM');
+    this.rejectPending(new Error('Codex app-server restarted after authentication changed.'));
   }
 
   private async ensureStarted(): Promise<void> {
@@ -48,10 +133,7 @@ export class CodexAppServerClient {
   }
 
   private async start(): Promise<void> {
-    const child = spawn('codex', ['app-server', '--stdio'], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: process.env,
-    });
+    const child = this.spawnAppServer();
     this.process = child;
     this.initialized = false;
     this.stderrTail = '';
@@ -62,12 +144,12 @@ export class CodexAppServerClient {
       this.stderrTail = `${this.stderrTail}${chunk.toString('utf8')}`.slice(-8_000);
     });
     child.once('error', (error) => {
-      this.handleExit(new Error(`Unable to start Codex CLI: ${error.message}`));
+      this.handleExit(child, new Error(`Unable to start Codex CLI: ${error.message}`));
     });
     child.once('exit', (code, signal) => {
       const detail = this.stderrTail.trim();
       const suffix = detail ? ` ${detail}` : '';
-      this.handleExit(new Error(`Codex app-server exited (${signal ?? code ?? 'unknown'}).${suffix}`));
+      this.handleExit(child, new Error(`Codex app-server exited (${signal ?? code ?? 'unknown'}).${suffix}`));
     });
 
     await this.sendRequest('initialize', {
@@ -82,6 +164,7 @@ export class CodexAppServerClient {
     });
     this.sendNotification('initialized', {});
     this.initialized = true;
+    this.startedAt = this.now();
   }
 
   private sendRequest(method: string, params: JsonRecord): Promise<unknown> {
@@ -134,9 +217,13 @@ export class CodexAppServerClient {
     }
   }
 
-  private handleExit(error: Error): void {
+  private handleExit(child: ChildProcessWithoutNullStreams, error: Error): void {
+    // A deliberately stopped process can exit after its replacement starts.
+    // Ignore that stale exit instead of clearing the replacement connection.
+    if (this.process !== child) return;
     this.process = null;
     this.initialized = false;
+    this.startedAt = 0;
     this.rejectPending(error);
   }
 
