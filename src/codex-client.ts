@@ -54,7 +54,7 @@ export function codexAppServerEnvironment(
 export class CodexAppServerClient {
   private process: ChildProcessWithoutNullStreams | null = null;
   private startPromise: Promise<void> | null = null;
-  private requestQueue: Promise<unknown> = Promise.resolve();
+  private freshnessQueue: Promise<unknown> = Promise.resolve();
   private initialized = false;
   private nextId = 1;
   private pending = new Map<number, PendingRequest>();
@@ -79,13 +79,16 @@ export class CodexAppServerClient {
   }
 
   async request(method: string, params: JsonRecord = {}): Promise<unknown> {
-    const run = async (): Promise<unknown> => {
-      await this.ensureFreshServer();
-      return this.sendRequest(method, params);
-    };
-    const pending = this.requestQueue.then(run, run);
-    this.requestQueue = pending.catch(() => undefined);
-    return pending;
+    // Serialize only auth/server freshness checks. Account reads are safe to
+    // run concurrently and can each take several seconds inside Codex; putting
+    // the full requests in one queue made the tab wait for their combined time.
+    const ready = this.freshnessQueue.then(
+      () => this.ensureFreshServer(),
+      () => this.ensureFreshServer(),
+    );
+    this.freshnessQueue = ready.catch(() => undefined);
+    await ready;
+    return this.sendRequest(method, params);
   }
 
   close(): void {
