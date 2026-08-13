@@ -38,6 +38,18 @@ function fingerprint(fileStat: FileStat): string {
   return `${fileStat.dev}:${fileStat.ino}:${fileStat.size}:${fileStat.mtimeMs}`;
 }
 
+export function codexAppServerEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...environment,
+    // Agentx may put a Codex dispatcher first on PATH. Its interactive remote
+    // transport is not valid for `codex app-server`; this opt-out is ignored by
+    // the official CLI and makes compatible wrappers launch the native server.
+    CDXX_INTEGRATION_MODE: 'disabled',
+  };
+}
+
 /** Small JSON-RPC client for the official `codex app-server` stdio transport. */
 export class CodexAppServerClient {
   private process: ChildProcessWithoutNullStreams | null = null;
@@ -62,7 +74,7 @@ export class CodexAppServerClient {
     this.readStat = options.readStat ?? stat;
     this.spawnAppServer = options.spawnAppServer ?? (() => spawn('codex', ['app-server', '--stdio'], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: process.env,
+      env: codexAppServerEnvironment(),
     }));
   }
 

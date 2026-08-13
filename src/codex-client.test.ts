@@ -4,7 +4,7 @@ import test from 'node:test';
 import { EventEmitter } from 'node:events';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 
-import { CodexAppServerClient } from './codex-client.js';
+import { CodexAppServerClient, codexAppServerEnvironment } from './codex-client.js';
 
 type FakeProcess = {
   process: ChildProcessWithoutNullStreams;
@@ -43,6 +43,14 @@ function fakeAppServer(): FakeProcess {
   });
   return { process: child, killedSignals };
 }
+
+test('opts usage app-server out of agentx interactive remote transport', () => {
+  assert.deepEqual(codexAppServerEnvironment({ PATH: '/test/bin', KEEP_ME: 'yes' }), {
+    PATH: '/test/bin',
+    KEEP_ME: 'yes',
+    CDXX_INTEGRATION_MODE: 'disabled',
+  });
+});
 
 test('restarts app-server before the next request when auth.json changes', async () => {
   let authMtime = 1;
