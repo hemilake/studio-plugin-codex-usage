@@ -9,8 +9,8 @@ This is a fork of [dongwook-chan/cloudcli-plugin-codex-usage](https://github.com
 
 The tab shows:
 
-- The rotation mode Studio uses (round robin or backup) and the enabled account with the most headroom, which is the one round robin picks next.
-- One card per account: label, email, plan, primary or backup role, whether it is disabled, each rate-limit window with its reset countdown, and "Limit reached" when Codex reports it.
+- The rotation mode Studio uses (round robin or backup) and the account Studio would give the next turn, worked out with the same rules as Studio's account selector at medium effort.
+- One card per account: label, email, plan, headroom weighted by plan ("≈ 60% of a Plus window"), primary or backup role, whether it is disabled, each rate-limit window with its reset countdown, and "Limit reached" when Codex reports it.
 - 30-day token activity for one account or for all of them added up.
 - Plan limits refresh every 60 seconds.
 
@@ -28,6 +28,8 @@ Studio writes the account list to `accounts.json` in `$CLOUDCLI_CODEX_ACCOUNTS_D
   "mode": "round_robin",
   "primaryAccountId": "default",
   "minHeadroomPercent": 5,
+  "planWeights": { "pro": 6 },
+  "roundRobinCursor": "default",
   "accounts": [
     { "id": "default", "label": "Principal", "codexHome": "/home/u/.codex", "enabled": true, "createdAt": "2026-10-26T09:00:00Z" },
     { "id": "acct-1a2b3c", "label": "Work", "codexHome": "/home/u/.cloudcli/codex-accounts/acct-1a2b3c", "enabled": true, "createdAt": "2026-10-26T09:00:00Z" }
@@ -37,8 +39,21 @@ Studio writes the account list to `accounts.json` in `$CLOUDCLI_CODEX_ACCOUNTS_D
 
 - Array order is priority order.
 - `mode` is `round_robin` or `backup`.
+- `planWeights` (optional) overrides the plan capacity table, relative to Plus. `roundRobinCursor` is the last account round robin handed out.
 - If the file is missing or is not valid JSON, the plugin shows a single account, `default`, using `$CODEX_HOME` or `~/.codex`.
 - An account whose `codexHome` has no `auth.json` shows as not signed in; no app-server is started for it.
+
+## Which account is next
+
+The summary copies the policy in Studio's `codex-accounts.selector.ts`; keep the two in step.
+
+- Remaining headroom is 100 minus the fullest live window. Windows whose reset time has passed count as empty, and a reached limit counts as 0.
+- Weighted headroom is remaining headroom times the plan weight (free 0.25, go 0.5, plus/team/business/enterprise/edu 1, pro 6, unknown 1). Compound plan names such as `self_serve_business_prolite` match a known plan by token, longest name first.
+- An account is eligible when it is enabled, signed in, has headroom above 0, and has weighted headroom of at least `minHeadroomPercent` times the effort factor (the tab uses medium, which is 1). An account whose limits could not be read counts as eligible, as in Studio.
+- Backup mode picks the primary if eligible, else the first eligible account in order. Round robin picks the first eligible account after `roundRobinCursor`, wrapping around.
+- If nothing is eligible, the account with the most weighted headroom is shown as the fallback.
+
+Studio also keeps a session on the account it already uses while that account qualifies. The tab has no session, so it leaves that rule out.
 
 ## Requirements
 
@@ -68,7 +83,7 @@ Routes served by the plugin server (proxied by the host, all read-only):
 
 | Route | What it returns |
 |---|---|
-| `GET /accounts` | Mode, primary account, `minHeadroomPercent` and, per account, `id`, `label`, `enabled`, `isPrimary`, `signedIn`, `email`, `planType`, `limits` and `error`. Accounts are queried in parallel; one failing account sets its own `error` and does not affect the rest. |
+| `GET /accounts` | Mode, primary account, `minHeadroomPercent`, `planWeights`, `roundRobinCursor` and, per account, `id`, `label`, `enabled`, `isPrimary`, `signedIn`, `email`, `planType`, `limits` and `error`. Accounts are queried in parallel; one failing account sets its own `error` and does not affect the rest. |
 | `GET /activity?account=<id>&days=30` | Daily token series for one account. `account` defaults to `default`. Returns 404 for an unknown account and 409 for one that is not signed in. |
 | `GET /activity?account=all&days=30` | The daily series of every signed-in account added up, with `accounts` (included ids) and `errors` (accounts left out and why). Lifetime tokens are summed; peak day and streaks are null because they cannot be combined across accounts. |
 | `GET /rate-limits` | Limits of the default account, as in the original plugin. |

@@ -88,6 +88,8 @@ function multiAccountServer(fixtures: AccountFixture[], mode: 'round_robin' | 'b
       mode,
       primaryAccountId: current[0]!.id,
       minHeadroomPercent: 5,
+      planWeights: { plus: 2 },
+      roundRobinCursor: current[0]!.id,
       accounts: current.map((fixture) => ({
         id: fixture.id,
         label: fixture.id.toUpperCase(),
@@ -146,6 +148,8 @@ test('GET /accounts reports every account and isolates a failing one', async () 
     };
     assert.equal(body.mode, 'backup');
     assert.equal(body.primaryAccountId, 'default');
+    assert.deepEqual((body as unknown as { planWeights: unknown }).planWeights, { plus: 2 });
+    assert.equal((body as unknown as { roundRobinCursor: unknown }).roundRobinCursor, 'default');
     assert.deepEqual(body.accounts.map((account) => account.id), ['default', 'broken', 'new', 'off']);
     const [ok, broken, signedOut, disabled] = body.accounts;
     assert.equal(ok?.signedIn, true);

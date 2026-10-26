@@ -15,6 +15,10 @@ export type Registry = {
   mode: AccountMode;
   primaryAccountId: string;
   minHeadroomPercent: number;
+  /** Plan weight overrides, lower-case plan name → capacity relative to Plus. */
+  planWeights: Record<string, number>;
+  /** Last account round robin handed out, or null. */
+  roundRobinCursor: string | null;
   accounts: RegistryAccount[];
 };
 
@@ -46,6 +50,8 @@ export function fallbackRegistry(environment: NodeJS.ProcessEnv = process.env): 
     mode: 'round_robin',
     primaryAccountId: 'default',
     minHeadroomPercent: 5,
+    planWeights: {},
+    roundRobinCursor: null,
     accounts: [{ id: 'default', label: 'Default', codexHome: defaultCodexHome(environment), enabled: true }],
   };
 }
@@ -78,10 +84,18 @@ export function parseRegistry(value: unknown): Registry | null {
     ? Math.min(Math.max(raw.minHeadroomPercent, 0), 100)
     : 5;
   const primary = nonEmptyString(raw.primaryAccountId);
+  const planWeights: Record<string, number> = {};
+  for (const [plan, weight] of Object.entries(record(raw.planWeights) ?? {})) {
+    const number = Number(weight);
+    if (Number.isFinite(number) && number > 0) planWeights[plan.toLowerCase()] = number;
+  }
+  const cursor = nonEmptyString(raw.roundRobinCursor);
   return {
     mode: raw.mode === 'backup' ? 'backup' : 'round_robin',
     primaryAccountId: primary && seen.has(primary) ? primary : accounts[0]!.id,
     minHeadroomPercent: minHeadroom,
+    planWeights,
+    roundRobinCursor: cursor && seen.has(cursor) ? cursor : null,
     accounts,
   };
 }

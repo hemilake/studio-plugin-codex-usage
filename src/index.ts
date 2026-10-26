@@ -32,34 +32,129 @@ type State = {
   loading: boolean;
 };
 
-/** Highest usedPercent across every window of every limit, or null if there are none. */
-export function maxUsedPercent(limits: RateLimitsData | null): number | null {
-  const percents = limits?.limits.flatMap((limit) => limit.windows.map((window) => window.usedPercent)) ?? [];
-  return percents.length > 0 ? Math.max(...percents) : null;
-}
-
-export type HeadroomCandidate = {
-  id: string;
-  enabled: boolean;
-  signedIn: boolean;
-  limits: RateLimitsData | null;
-};
+// Selection policy copied from Studio core
+// (server/modules/providers/list/codex/accounts/codex-accounts.selector.ts) so the
+// summary names the account Studio would really hand the next turn to. Keep the two
+// in step. The sticky-session rule is left out: the tab has no session.
 
 /**
- * The enabled, signed-in account with the most headroom: lowest max usedPercent,
- * skipping accounts where any limit reports a reached type. Ties go to the
- * earlier account (priority order).
+ * Codex capacity of each plan relative to Plus. Estimates from OpenAI's
+ * published multipliers; unknown plans count as Plus. The registry's
+ * `planWeights` overrides any entry.
  */
-export function pickMostHeadroom(accounts: HeadroomCandidate[]): string | null {
-  let best: { id: string; used: number } | null = null;
-  for (const account of accounts) {
-    if (!account.enabled || !account.signedIn || !account.limits) continue;
-    if (account.limits.limits.some((limit) => limit.reachedType !== null)) continue;
-    const used = maxUsedPercent(account.limits);
-    if (used === null) continue;
-    if (!best || used < best.used) best = { id: account.id, used };
+export const DEFAULT_PLAN_WEIGHTS: Record<string, number> = {
+  free: 0.25,
+  go: 0.5,
+  plus: 1,
+  team: 1,
+  business: 1,
+  enterprise: 1,
+  edu: 1,
+  pro: 6,
+};
+
+const EFFORT_HEADROOM_FACTOR: Record<string, number> = {
+  minimal: 0.5,
+  low: 1,
+  medium: 1,
+  high: 2,
+  xhigh: 3,
+};
+
+export function planWeight(planType: string | null, overrides: Record<string, number> = {}): number {
+  if (!planType) return 1;
+  const key = planType.toLowerCase();
+  const table = { ...DEFAULT_PLAN_WEIGHTS, ...overrides };
+  if (typeof table[key] === 'number') return table[key]!;
+  // Codex reports compound names such as `self_serve_business_prolite`; match
+  // the most specific known plan inside them, longest name first.
+  const match = Object.keys(table)
+    .sort((a, b) => b.length - a.length)
+    .find((name) => key.split(/[^a-z0-9]+/).includes(name));
+  return match ? table[match]! : 1;
+}
+
+/**
+ * Percent of the tightest window still free, or null when the limits were not
+ * read. Windows whose reset time has passed count as empty; a reached limit is 0.
+ */
+export function remainingPercent(limits: RateLimitsData | null, now: number): number | null {
+  if (!limits) return null;
+  const windows = limits.limits.flatMap((limit) => limit.windows);
+  const live = windows.filter((window) => window.resetsAt === null || Date.parse(window.resetsAt) > now);
+  if (limits.limits.some((limit) => limit.reachedType !== null) && live.length > 0) return 0;
+  if (live.length === 0) return windows.length > 0 ? 100 : null;
+  return Math.max(0, 100 - Math.max(...live.map((window) => window.usedPercent)));
+}
+
+export function requiredHeadroomFor(effort: string | null | undefined, minHeadroomPercent: number): number {
+  const factor = EFFORT_HEADROOM_FACTOR[(effort || 'medium').toLowerCase()] ?? 1;
+  return minHeadroomPercent * factor;
+}
+
+/** Remaining percent times plan weight: "percent of a Plus window". Null when unknown. */
+export function weightedHeadroom(
+  account: Pick<AccountView, 'planType' | 'limits'>,
+  planWeights: Record<string, number>,
+  now: number,
+): number | null {
+  const remaining = remainingPercent(account.limits, now);
+  return remaining === null ? null : remaining * planWeight(account.planType, planWeights);
+}
+
+export type SelectionInput = Pick<AccountsResponse, 'mode' | 'primaryAccountId' | 'minHeadroomPercent' | 'planWeights' | 'roundRobinCursor'> & {
+  accounts: Pick<AccountView, 'id' | 'enabled' | 'signedIn' | 'planType' | 'limits'>[];
+};
+
+export type Selection = {
+  accountId: string;
+  reason: 'single' | 'primary' | 'backup' | 'round_robin' | 'fallback';
+};
+
+type Candidate = { id: string; enabled: boolean; signedIn: boolean; headroom: number | null; eligible: boolean };
+
+/** The account Studio would pick for the next turn at medium effort. */
+export function selectNextAccount(data: SelectionInput, now: number, effort: string | null = 'medium'): Selection | null {
+  const accounts = data.accounts;
+  if (accounts.length === 0) return null;
+  if (accounts.length === 1) return { accountId: accounts[0]!.id, reason: 'single' };
+
+  const required = requiredHeadroomFor(effort, data.minHeadroomPercent);
+  const candidates: Candidate[] = accounts.map((account) => {
+    const base = { id: account.id, enabled: account.enabled, signedIn: account.signedIn };
+    if (!account.enabled || !account.signedIn) return { ...base, headroom: null, eligible: false };
+    const remaining = remainingPercent(account.limits, now);
+    // Never read (or the read failed): Studio tries it rather than skipping it.
+    if (remaining === null) return { ...base, headroom: null, eligible: true };
+    const headroom = remaining * planWeight(account.planType, data.planWeights);
+    return { ...base, headroom, eligible: remaining > 0 && headroom >= required };
+  });
+  const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+
+  if (data.mode === 'backup') {
+    const primary = byId.get(data.primaryAccountId);
+    if (primary?.eligible) return { accountId: primary.id, reason: 'primary' };
+    const backup = candidates.find((candidate) => candidate.eligible);
+    if (backup) return { accountId: backup.id, reason: 'backup' };
+  } else {
+    const cursorIndex = data.roundRobinCursor
+      ? candidates.findIndex((candidate) => candidate.id === data.roundRobinCursor)
+      : -1;
+    for (let step = 1; step <= candidates.length; step += 1) {
+      const candidate = candidates[(cursorIndex + step + candidates.length) % candidates.length]!;
+      if (candidate.eligible) return { accountId: candidate.id, reason: 'round_robin' };
+    }
   }
-  return best?.id ?? null;
+
+  const usable = candidates.filter((candidate) => candidate.enabled && candidate.signedIn);
+  const best = usable
+    .filter((candidate) => candidate.headroom !== null)
+    .sort((a, b) => (b.headroom ?? 0) - (a.headroom ?? 0))[0]
+    ?? usable[0]
+    ?? candidates.find((candidate) => candidate.enabled)
+    ?? byId.get(data.primaryAccountId)
+    ?? candidates[0]!;
+  return { accountId: best.id, reason: 'fallback' };
 }
 
 const MONO = "'JetBrains Mono', 'Fira Code', ui-monospace, monospace";
@@ -194,9 +289,16 @@ function renderLimits(theme: ThemeColors, data: RateLimitsData): string {
   return `${reachedNote}${windows.join('')}`;
 }
 
-function renderAccount(theme: ThemeColors, data: AccountsResponse, account: AccountView): string {
+function formatHeadroom(headroom: number): string {
+  return `≈ ${Math.round(headroom)}% of a Plus window`;
+}
+
+function renderAccount(theme: ThemeColors, data: AccountsResponse, account: AccountView, next: Selection | null): string {
+  const headroom = account.signedIn ? weightedHeadroom(account, data.planWeights ?? {}, Date.now()) : null;
   const badges = [
+    next?.accountId === account.id ? badge('Next', 'cx-badge-accent') : '',
     account.planType ? badge(account.planType) : '',
+    headroom !== null ? badge(formatHeadroom(headroom), 'cx-badge-plain') : '',
     data.mode === 'backup' ? badge(account.isPrimary ? 'Primary' : 'Backup', account.isPrimary ? 'cx-badge-accent' : '') : '',
     account.enabled ? '' : badge('Disabled', 'cx-badge-off'),
     account.limits && account.limits.resetCreditsAvailable > 0
@@ -217,31 +319,44 @@ function renderAccount(theme: ThemeColors, data: AccountsResponse, account: Acco
   return `<section class="cx-card cx-account${account.enabled ? '' : ' cx-account-off'}">${header}${body}${error}</section>`;
 }
 
-function renderSummary(data: AccountsResponse): string {
-  const mode = data.mode === 'backup' ? 'Backup' : 'Round robin';
-  const bestId = pickMostHeadroom(data.accounts);
-  const best = data.accounts.find((account) => account.id === bestId);
-  const primary = data.accounts.find((account) => account.isPrimary);
-  const parts: string[] = [];
-  if (data.mode === 'backup' && primary) parts.push(`Primary: ${escapeHtml(primary.label)}.`);
-  if (best) {
-    const used = maxUsedPercent(best.limits) ?? 0;
-    const lead = data.mode === 'round_robin' ? 'Next pick' : 'Most headroom';
-    parts.push(`${lead}: <strong>${escapeHtml(best.label)}</strong> (${formatPercent(used)} used at most).`);
-  } else {
-    parts.push('No enabled account has headroom right now.');
+/** Sentence for the header; exported for tests. */
+export function summaryText(data: AccountsResponse, next: Selection | null, now: number): string {
+  const label = (id: string) => escapeHtml(data.accounts.find((account) => account.id === id)?.label ?? id);
+  if (!next) return 'No accounts.';
+  const picked = data.accounts.find((account) => account.id === next.accountId);
+  const headroom = picked ? weightedHeadroom(picked, data.planWeights ?? {}, now) : null;
+  const detail = headroom === null ? '' : ` (${formatHeadroom(headroom)})`;
+  const name = `<strong>${label(next.accountId)}</strong>${detail}`;
+  switch (next.reason) {
+    case 'single':
+      return `Only account: ${name}.`;
+    case 'primary':
+      return `Next turn: ${name}, the primary.`;
+    case 'backup':
+      return `Next turn: ${name}, a backup; the primary ${label(data.primaryAccountId)} lacks headroom.`;
+    case 'round_robin':
+      return `Next turn: ${name}${data.roundRobinCursor ? `, after ${label(data.roundRobinCursor)}` : ''}.`;
+    case 'fallback': {
+      const required = requiredHeadroomFor('medium', data.minHeadroomPercent);
+      return `No account has the ${Math.round(required)}% headroom a turn needs. Fallback: ${name}.`;
+    }
   }
+}
+
+function renderSummary(data: AccountsResponse, next: Selection | null): string {
+  const mode = data.mode === 'backup' ? 'Backup' : 'Round robin';
   return `
     <div class="cx-summary">
       ${badge(mode, 'cx-badge-accent')}
-      <span>${parts.join(' ')}</span>
+      <span>${summaryText(data, next, Date.now())}</span>
     </div>`;
 }
 
 function renderAccounts(theme: ThemeColors, data: AccountsResponse | null, error: string | null): string {
   if (error) return card('accounts', errorNote(error));
   if (!data) return card('accounts', '<div class="cx-muted">Loading…</div>');
-  return `${renderSummary(data)}<div class="cx-accounts">${data.accounts.map((account) => renderAccount(theme, data, account)).join('')}</div>`;
+  const next = selectNextAccount({ ...data, planWeights: data.planWeights ?? {}, roundRobinCursor: data.roundRobinCursor ?? null }, Date.now());
+  return `${renderSummary(data, next)}<div class="cx-accounts">${data.accounts.map((account) => renderAccount(theme, data, account, next)).join('')}</div>`;
 }
 
 function renderChart(activity: ActivityData): string {
@@ -257,7 +372,8 @@ function renderChart(activity: ActivityData): string {
     <div class="cx-axis"><span>${activity.daily[0]?.date ?? ''}</span><span>${activity.daily.at(-1)?.date ?? ''}</span></div>`;
 }
 
-function renderSelector(state: State): string {
+/** The <option> list; the <select> itself is created once and kept. */
+function renderSelectorOptions(state: State): string {
   const accounts = state.accounts?.accounts ?? [];
   const options = [
     ...accounts.map((account) => ({ value: account.id, label: account.label })),
@@ -267,14 +383,13 @@ function renderSelector(state: State): string {
   const items = options.map((option) => (
     `<option value="${escapeHtml(option.value)}"${option.value === state.activityAccount ? ' selected' : ''}>${escapeHtml(option.label)}</option>`
   )).join('');
-  return `<label class="cx-select-wrap"><span class="cx-eyebrow">account</span><select class="cx-select">${items}</select></label>`;
+  return items;
 }
 
 function renderActivity(state: State): string {
   const data = state.activity;
-  const heading = `<div class="cx-section-head"><div class="cx-section-title">Token activity</div>${renderSelector(state)}</div>`;
-  if (state.activityError) return `${heading}${card('token activity (30 days)', errorNote(state.activityError))}`;
-  if (!data) return `${heading}${card('token activity (30 days)', '<div class="cx-muted">Loading…</div>')}`;
+  if (state.activityError) return card('token activity (30 days)', errorNote(state.activityError));
+  if (!data) return card('token activity (30 days)', '<div class="cx-muted">Loading…</div>');
   const failed = (data as ActivityData & { errors?: { id: string; error: string }[] }).errors ?? [];
   const failedNote = failed.length > 0
     ? errorNote(`Left out: ${failed.map((entry) => `${entry.id} (${entry.error})`).join('; ')}`)
@@ -286,7 +401,6 @@ function renderActivity(state: State): string {
     ['current streak', data.summary.currentStreakDays === null ? '—' : `${data.summary.currentStreakDays}d`],
   ];
   return `
-    ${heading}
     ${failedNote}
     <div class="cx-stats">
       ${stats.map(([label, value]) => `<div class="cx-stat"><div class="cx-stat-value">${value}</div><div class="cx-eyebrow">${label}</div></div>`).join('')}
@@ -311,7 +425,7 @@ function stylesheet(theme: ThemeColors): string {
     .cx-email{font-size:.68rem;color:${theme.muted};overflow-wrap:anywhere;margin-bottom:14px}
     .cx-account-head + .cx-limit,.cx-account-head + .cx-muted,.cx-account-head + .cx-reached{margin-top:12px}
     .cx-eyebrow{font-size:.62rem;color:${theme.muted};letter-spacing:.11em;text-transform:uppercase;margin-bottom:14px}
-    .cx-badge{display:inline-block;border:1px solid ${theme.border};border-radius:4px;padding:2px 7px;margin-left:6px;font-size:.64rem;color:${theme.muted};letter-spacing:normal;text-transform:none}.cx-badge-accent{border-color:${theme.accent};color:${theme.accentText}}.cx-badge-off{border-color:${theme.muted};color:${theme.text}}
+    .cx-badge{display:inline-block;border:1px solid ${theme.border};border-radius:4px;padding:2px 7px;margin-left:6px;font-size:.64rem;color:${theme.muted};letter-spacing:normal;text-transform:none}.cx-badge-accent{border-color:${theme.accent};color:${theme.accentText}}.cx-badge-off{border-color:${theme.muted};color:${theme.text}}.cx-badge-plain{border-color:transparent;padding-left:2px;padding-right:2px}
     .cx-reached{font-size:.72rem;font-weight:700;color:${theme.bad};margin-bottom:10px}
     .cx-limit{margin-bottom:15px}.cx-limit:last-child{margin-bottom:0}.cx-limit-row{display:flex;justify-content:space-between;gap:12px;font-size:.72rem;margin-bottom:6px}.cx-muted{font-size:.73rem;color:${theme.muted}}
     .cx-track{height:7px;background:${theme.border};border-radius:4px;overflow:hidden}.cx-fill{height:100%;border-radius:4px;transition:width .35s ease}
@@ -342,25 +456,57 @@ export function mount(container: HTMLElement, api: PluginAPI): void {
   let disposed = false;
   let activityRequest = 0;
 
+  // The frame is built once. Refreshes replace only the data regions, so the
+  // account <select> keeps its DOM node and an open dropdown stays open.
+  root.innerHTML = `
+    <div class="cx-style"></div>
+    <div class="cx-header">
+      <div class="cx-title">Codex Usage<span class="cx-cursor">▌</span></div>
+      <button class="cx-refresh" type="button"></button>
+    </div>
+    <div class="cx-accounts-region"></div>
+    <div class="cx-section-head">
+      <div class="cx-section-title">Token activity</div>
+      <label class="cx-select-wrap"><span class="cx-eyebrow">account</span><select class="cx-select"></select></label>
+    </div>
+    <div class="cx-activity-region"></div>
+    <div class="cx-footnote">Usage is read through the official Codex app-server, one per account. This plugin never reads or stores your authentication tokens.</div>`;
+  const styleRegion = root.querySelector<HTMLElement>('.cx-style')!;
+  const refreshButton = root.querySelector<HTMLButtonElement>('.cx-refresh')!;
+  const accountsRegion = root.querySelector<HTMLElement>('.cx-accounts-region')!;
+  const select = root.querySelector<HTMLSelectElement>('.cx-select')!;
+  const activityRegion = root.querySelector<HTMLElement>('.cx-activity-region')!;
+  let renderedTheme: string | null = null;
+  let renderedOptions: string | null = null;
+
+  refreshButton.addEventListener('click', () => void load(true));
+  select.addEventListener('change', () => {
+    state.activityAccount = select.value;
+    state.activity = null;
+    state.activityError = null;
+    render(api.context);
+    void loadActivity();
+  });
+  // Option changes that arrived while the dropdown had focus are applied on blur.
+  select.addEventListener('blur', () => render(api.context));
+
   function render(context: PluginContext): void {
     if (disposed) return;
     const theme = colors(context.theme === 'dark');
-    root.innerHTML = `${stylesheet(theme)}
-      <div class="cx-header">
-        <div class="cx-title">Codex Usage<span class="cx-cursor">▌</span></div>
-        <button class="cx-refresh" type="button" ${state.loading ? 'disabled' : ''}>${state.loading ? 'refreshing…' : '↻ refresh'}</button>
-      </div>
-      ${renderAccounts(theme, state.accounts, state.accountsError)}
-      ${renderActivity(state)}
-      <div class="cx-footnote">Usage is read through the official Codex app-server, one per account. This plugin never reads or stores your authentication tokens.</div>`;
-    root.querySelector<HTMLButtonElement>('.cx-refresh')?.addEventListener('click', () => void load(true));
-    root.querySelector<HTMLSelectElement>('.cx-select')?.addEventListener('change', (event) => {
-      state.activityAccount = (event.target as HTMLSelectElement).value;
-      state.activity = null;
-      state.activityError = null;
-      render(api.context);
-      void loadActivity();
-    });
+    if (renderedTheme !== context.theme) {
+      styleRegion.innerHTML = stylesheet(theme);
+      renderedTheme = context.theme;
+    }
+    refreshButton.disabled = state.loading;
+    refreshButton.textContent = state.loading ? 'refreshing…' : '↻ refresh';
+    accountsRegion.innerHTML = renderAccounts(theme, state.accounts, state.accountsError);
+    const options = renderSelectorOptions(state);
+    if (options !== renderedOptions && document.activeElement !== select) {
+      select.innerHTML = options;
+      select.value = state.activityAccount;
+      renderedOptions = options;
+    }
+    activityRegion.innerHTML = renderActivity(state);
   }
 
   async function loadAccounts(): Promise<void> {

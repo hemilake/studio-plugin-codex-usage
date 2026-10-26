@@ -49,6 +49,8 @@ export type AccountsResponse = {
   mode: AccountMode;
   primaryAccountId: string;
   minHeadroomPercent: number;
+  planWeights: Record<string, number>;
+  roundRobinCursor: string | null;
   accounts: AccountView[];
 };
 
@@ -225,6 +227,8 @@ export function createUsageServer(options: UsageServerOptions | UsageClient = {}
           mode: registry.mode,
           primaryAccountId: registry.primaryAccountId,
           minHeadroomPercent: registry.minHeadroomPercent,
+          planWeights: registry.planWeights,
+          roundRobinCursor: registry.roundRobinCursor,
           accounts,
         };
         response.end(JSON.stringify(body));

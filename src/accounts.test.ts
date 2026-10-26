@@ -27,6 +27,8 @@ test('missing accounts.json falls back to the default account', async () => {
       mode: 'round_robin',
       primaryAccountId: 'default',
       minHeadroomPercent: 5,
+      planWeights: {},
+      roundRobinCursor: null,
       accounts: [{ id: 'default', label: 'Default', codexHome: '/srv/codex', enabled: true }],
     });
   });
@@ -63,6 +65,8 @@ test('reads the registry keeping array order as priority order', async () => {
       mode: 'backup',
       primaryAccountId: 'acct-2',
       minHeadroomPercent: 10,
+      planWeights: { Pro: 8, junk: 'x', zero: 0 },
+      roundRobinCursor: 'default',
       accounts: [
         { id: 'acct-3', label: 'Third', codexHome: '/h/3', enabled: true, createdAt: '2026-10-26T09:00:00Z' },
         { id: 'default', label: 'Principal', codexHome: '/h/default', enabled: true },
@@ -73,6 +77,8 @@ test('reads the registry keeping array order as priority order', async () => {
     assert.equal(registry.mode, 'backup');
     assert.equal(registry.primaryAccountId, 'acct-2');
     assert.equal(registry.minHeadroomPercent, 10);
+    assert.deepEqual(registry.planWeights, { pro: 8 });
+    assert.equal(registry.roundRobinCursor, 'default');
     assert.deepEqual(registry.accounts.map((account) => account.id), ['acct-3', 'default', 'acct-2']);
     assert.equal(registry.accounts[2]?.enabled, false);
   });
@@ -82,6 +88,7 @@ test('parseRegistry skips invalid and repeated entries and fixes an unknown prim
   const registry = parseRegistry({
     mode: 'something-else',
     primaryAccountId: 'gone',
+    roundRobinCursor: 'gone',
     minHeadroomPercent: 500,
     accounts: [
       null,
@@ -95,6 +102,7 @@ test('parseRegistry skips invalid and repeated entries and fixes an unknown prim
   assert.equal(registry.mode, 'round_robin');
   assert.equal(registry.primaryAccountId, 'a');
   assert.equal(registry.minHeadroomPercent, 100);
+  assert.equal(registry.roundRobinCursor, null);
   assert.deepEqual(registry.accounts, [
     { id: 'a', label: 'a', codexHome: '/h/a', enabled: true },
     { id: 'b', label: 'B', codexHome: '/h/b', enabled: true },
