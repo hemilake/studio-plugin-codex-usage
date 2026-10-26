@@ -163,3 +163,58 @@ export function normalizeActivity(value: unknown, days: number, nowMs: number): 
     },
   };
 }
+
+function sumNullable(values: (number | null)[]): number | null {
+  const present = values.filter((value): value is number => value !== null);
+  return present.length > 0 ? present.reduce((total, value) => total + value, 0) : null;
+}
+
+function maxNullable(values: (number | null)[]): number | null {
+  const present = values.filter((value): value is number => value !== null);
+  return present.length > 0 ? Math.max(...present) : null;
+}
+
+/**
+ * Add several accounts' activity day by day. Lifetime tokens are summed and the
+ * longest turn is the maximum; peak day and streaks are per-account figures that
+ * cannot be combined, so they are null.
+ */
+export function sumActivity(series: ActivityData[], days: number, nowMs: number): ActivityData {
+  const base = normalizeActivity({}, days, nowMs);
+  const tokensByDate = new Map(base.daily.map((day) => [day.date, 0]));
+  for (const activity of series) {
+    for (const day of activity.daily) {
+      if (tokensByDate.has(day.date)) tokensByDate.set(day.date, (tokensByDate.get(day.date) ?? 0) + day.tokens);
+    }
+  }
+  const daily = base.daily.map((day) => ({ date: day.date, tokens: tokensByDate.get(day.date) ?? 0 }));
+  return {
+    days: base.days,
+    totalTokens: daily.reduce((total, day) => total + day.tokens, 0),
+    daily,
+    summary: {
+      lifetimeTokens: sumNullable(series.map((activity) => activity.summary.lifetimeTokens)),
+      peakDailyTokens: null,
+      longestRunningTurnSec: maxNullable(series.map((activity) => activity.summary.longestRunningTurnSec)),
+      currentStreakDays: null,
+      longestStreakDays: null,
+    },
+  };
+}
+
+export type AccountIdentity = {
+  type: string | null;
+  email: string | null;
+  planType: string | null;
+};
+
+/** Read the `account/read` response. Returns null when Codex reports no account. */
+export function normalizeAccount(value: unknown): AccountIdentity | null {
+  const account = record(record(value)?.account);
+  if (!account) return null;
+  return {
+    type: nullableString(account.type),
+    email: nullableString(account.email),
+    planType: nullableString(account.planType),
+  };
+}

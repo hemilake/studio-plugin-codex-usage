@@ -27,6 +27,8 @@ type FileStat = {
 };
 
 type CodexAppServerClientOptions = {
+  /** CODEX_HOME for the spawned app-server; auth.json is watched inside it. */
+  codexHome?: string;
   authPath?: string;
   maxServerAgeMs?: number;
   now?: () => number;
@@ -36,6 +38,14 @@ type CodexAppServerClientOptions = {
 
 function fingerprint(fileStat: FileStat): string {
   return `${fileStat.dev}:${fileStat.ino}:${fileStat.size}:${fileStat.mtimeMs}`;
+}
+
+/** Environment for the app-server: the plugin's own, with CODEX_HOME set when given. */
+export function codexAppServerEnvironment(
+  codexHome?: string,
+  environment: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return codexHome ? { ...environment, CODEX_HOME: codexHome } : { ...environment };
 }
 
 /** Small JSON-RPC client for the official `codex app-server` stdio transport. */
@@ -56,12 +66,15 @@ export class CodexAppServerClient {
   private readonly spawnAppServer: () => ChildProcessWithoutNullStreams;
 
   constructor(options: CodexAppServerClientOptions = {}) {
-    this.authPath = options.authPath ?? path.join(os.homedir(), '.codex', 'auth.json');
+    const codexHome = options.codexHome;
+    this.authPath = options.authPath
+      ?? path.join(codexHome ?? process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex'), 'auth.json');
     this.maxServerAgeMs = options.maxServerAgeMs ?? DEFAULT_SERVER_MAX_AGE_MS;
     this.now = options.now ?? Date.now;
     this.readStat = options.readStat ?? stat;
     this.spawnAppServer = options.spawnAppServer ?? (() => spawn('codex', ['app-server', '--stdio'], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: codexAppServerEnvironment(codexHome),
     }));
   }
 
@@ -158,7 +171,7 @@ export class CodexAppServerClient {
       clientInfo: {
         name: 'cloudcli_codex_usage',
         title: 'CloudCLI Codex Usage',
-        version: '1.0.0',
+        version: '1.1.0',
       },
       capabilities: {
         optOutNotificationMethods: ['account/rateLimits/updated'],

@@ -1,8 +1,7 @@
-import { CodexAppServerClient } from './codex-client.js';
 import { createUsageServer } from './server-app.js';
 
-const client = new CodexAppServerClient();
-const server = createUsageServer(client);
+// One Codex app-server per account in the registry, started on first use.
+const server = createUsageServer();
 
 server.listen(0, '127.0.0.1', () => {
   const address = server.address();
