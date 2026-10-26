@@ -4,7 +4,7 @@ import test from 'node:test';
 import { EventEmitter } from 'node:events';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 
-import { CodexAppServerClient } from './codex-client.js';
+import { CodexAppServerClient, codexAppServerEnvironment } from './codex-client.js';
 
 type FakeProcess = {
   process: ChildProcessWithoutNullStreams;
@@ -44,6 +44,34 @@ function fakeAppServer(): FakeProcess {
   });
   return { process: child, killedSignals, stdout };
 }
+
+test('app-server environment sets CODEX_HOME only when an account home is given', () => {
+  assert.deepEqual(codexAppServerEnvironment('/h/acct', { PATH: '/bin', CODEX_HOME: '/old' }), {
+    PATH: '/bin',
+    CODEX_HOME: '/h/acct',
+  });
+  assert.deepEqual(codexAppServerEnvironment(undefined, { PATH: '/bin' }), { PATH: '/bin' });
+});
+
+test('watches auth.json inside the account Codex home', async () => {
+  const statted: string[] = [];
+  const child = fakeAppServer();
+  const client = new CodexAppServerClient({
+    codexHome: '/h/acct',
+    readStat: async (filePath) => {
+      statted.push(filePath);
+      return { dev: 1, ino: 2, size: 100, mtimeMs: 1 };
+    },
+    spawnAppServer: () => child.process,
+  });
+  try {
+    await client.request('account/read');
+    assert(statted.length > 0);
+    assert(statted.every((filePath) => filePath === '/h/acct/auth.json'));
+  } finally {
+    client.close();
+  }
+});
 
 test('runs account reads concurrently after one serialized freshness check', async () => {
   const child = fakeAppServer();
